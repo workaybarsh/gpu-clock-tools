@@ -1,4 +1,5 @@
 param(
+    [Alias('Desktop')]
     [switch]$DesktopShortcut
 )
 

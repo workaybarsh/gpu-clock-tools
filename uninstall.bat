@@ -17,5 +17,11 @@ set "ok="
 set /p "ok=   Type Y to continue: "
 if /i not "%ok%"=="Y" exit /b 0
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall.ps1" %*
+rem --- run from %TEMP% so the script can delete its own install folder ---
+set "TMPSCRIPT=%TEMP%\gpu-clock-uninstall.ps1"
+copy /y "%~dp0uninstall.ps1" "%TMPSCRIPT%" >nul
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%TMPSCRIPT%" %*
+
+del /q "%TMPSCRIPT%" >nul 2>&1
 pause

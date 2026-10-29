@@ -338,6 +338,7 @@ $locked = $false
 $lastApply = [datetime]::MinValue
 $miss = 0
 $safe = $target
+$script:counterBroken = $false
 
 Write-Log "watchdog started (PID $PID)"
 Write-Log "card: $($state.Name) | lock target $target MHz from $source"
@@ -362,8 +363,29 @@ try {
             if ($null -ne $s.Util -and $s.Util -ge $LoadThreshold) { $worked = $true; $who = "load $($s.Util)%" }
         }
         else {
-            $top = Get-TopGpuUser -Minimum $LoadThreshold
-            if ($top) { $worked = $true; $who = "$($top.Name) [PID $($top.Pid)] $($top.Percent)%" }
+            $users = Get-GpuUsers
+            if ($users.Count -eq 0) {
+                if (-not $script:counterBroken) {
+                    Write-Log 'GPU Engine counters unavailable -> falling back to total GPU utilization.'
+                    $script:counterBroken = $true
+                }
+                $s = Get-GpuState
+                if ($null -ne $s.Util -and $s.Util -ge $LoadThreshold) { $worked = $true; $who = "load $($s.Util)%" }
+            }
+            else {
+                $bestPid = $null
+                $bestVal = 0.0
+                foreach ($k in $users.Keys) {
+                    if ($users[$k] -gt $bestVal) { $bestVal = $users[$k]; $bestPid = $k }
+                }
+                if ($null -ne $bestPid -and $bestVal -ge $LoadThreshold) {
+                    $proc = Get-Process -Id $bestPid -ErrorAction SilentlyContinue
+                    $nm = ''
+                    if ($proc) { $nm = $proc.ProcessName }
+                    $worked = $true
+                    $who = "$nm [PID $bestPid] $([math]::Round($bestVal, 1))%"
+                }
+            }
         }
 
         if (-not $worked) {
