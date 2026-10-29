@@ -100,6 +100,32 @@ Main tuner options:
 
 ---
 
+## Install (optional, one click)
+
+The repo works as-is: double click `launch.bat`. If you want it in the Start
+menu like a normal app:
+
+```text
+install.bat            -> copies to %LOCALAPPDATA%\gpu-clock-tools\app
+                          and adds "GPU Clock Tools" to the Start menu
+install.bat -Desktop   -> also adds a desktop shortcut
+```
+
+`launch.bat` is the one-click menu: detect, auto tune, watchdog, clear, status.
+
+### Removal with no trace
+
+```text
+uninstall.bat          -> stops running instances, releases any clock lock,
+                          deletes the shortcut, the profile and the app folder
+```
+
+After that run **nothing** is left behind: no scheduled tasks, no services, no
+registry entries, no autostart. The only thing an uninstall cannot undo is the
+driver's own behaviour, which is out of this tool's control.
+
+---
+
 ## How the watchdog detects the workload
 
 This is the interesting part. Three options, best one is automatic:

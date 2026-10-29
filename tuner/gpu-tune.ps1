@@ -211,6 +211,8 @@ function Load-Profiles {
 function Save-Profile {
     param($Info, [int]$SafeClock, [int]$TargetTemperature)
     try {
+        $dir = Split-Path $ProfilePath -Parent
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
         $key = Get-ProfileKey $Info
         $h = Load-Profiles
         $h[$key] = [pscustomobject]@{
@@ -456,6 +458,10 @@ if ($Mode -eq 'Auto') {
     }
 
     $cap = [int]$info.MaxClock
+    if ($null -ne $info.CoreClock -and $info.CoreClock -gt 0 -and $info.CoreClock -lt $cap) {
+        $cap = [int]$info.CoreClock
+        Write-Log "Search starts at the current clock ($cap MHz) rather than the maximum."
+    }
     $found = $false
     $steps = 0
 
