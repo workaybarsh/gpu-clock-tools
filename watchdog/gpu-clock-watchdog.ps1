@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     gpu-clock-watchdog - keeps a GPU clock cap while a workload is running.
 
@@ -384,7 +384,10 @@ try {
 
         if ($needApply) {
             if (Set-ClockLock $safe) {
-                if (-not $locked) { Write-Log "Lock applied: $safe MHz (work: $who)" }
+                if (-not $locked) {
+                    if ($DryRun) { Write-Log "[DryRun] would apply: $safe MHz (work: $who)" }
+                    else { Write-Log "Lock applied: $safe MHz (work: $who)" }
+                }
                 $locked = $true
                 $lastApply = Get-Date
             }
