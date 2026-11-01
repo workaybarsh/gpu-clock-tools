@@ -109,7 +109,7 @@
     .\gpu-clock-watchdog.ps1 -Percent 76 -ProcessName YOUR_MINER
 
 .EXAMPLE
-    .\gpu-clock-watchdog.ps1 -TargetClock 2350 -TargetTemp 65 -ProcessName YOUR_MINER
+    .\gpu-clock-watchdog.ps1 -TargetClock 1900 -TargetTemp 65 -ProcessName YOUR_MINER
 
 .EXAMPLE
     .\gpu-clock-watchdog.ps1 -LoadOnly -LoadThreshold 30
@@ -186,9 +186,9 @@ function Invoke-Smi {
 
 function To-Num {
     # PowerShell's [double] cast happens to be culture-invariant, but
-    # [double]::TryParse is not. On a Turkish system "." is the thousands
-    # separator, so a culture-sensitive read of "62.09" returns 6209 - enough to
-    # make the safety logic throttle a 62 C card down by several steps. Pin the
+    # [double]::TryParse is not. In cultures where "." is the thousands
+    # separator, a culture-sensitive read of "62.09" returns 6209 - enough to
+    # make the safety logic throttle a cool card down by several steps. Pin the
     # invariant culture so every caller sees the same number.
     param($Value)
     if ($null -eq $Value) { return $null }

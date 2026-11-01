@@ -63,7 +63,7 @@ and release it when the work ends.
 .\watchdog\gpu-clock-watchdog.ps1 -LoadOnly -LoadThreshold 30
 
 # also hold a working temperature, and survive idle gaps inside a long job
-.\watchdog\gpu-clock-watchdog.ps1 -TargetClock 2350 -TargetTemp 65 -ProcessName YOUR_MINER -MissLimit 0
+.\watchdog\gpu-clock-watchdog.ps1 -TargetClock 1900 -TargetTemp 65 -ProcessName YOUR_MINER -MissLimit 0
 ```
 
 ### Tuner (find the right value once per card)

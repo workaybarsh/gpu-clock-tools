@@ -162,8 +162,8 @@ function Invoke-Smi {
 
 function To-Num {
     # PowerShell's [double] cast happens to be culture-invariant, but
-    # [double]::TryParse is not. On a Turkish system "." is the thousands
-    # separator, so a culture-sensitive read of "62.09" returns 6209 - enough to
+    # [double]::TryParse is not. In cultures where "." is the thousands
+    # separator, a culture-sensitive read of "62.09" returns 6209 - enough to
     # make the temperature target unreachable and to drive the search to its
     # lower bound. Pin the invariant culture so every caller agrees.
     param($Value)
