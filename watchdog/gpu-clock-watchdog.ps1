@@ -185,10 +185,16 @@ function Invoke-Smi {
 }
 
 function To-Num {
+    # PowerShell's [double] cast happens to be culture-invariant, but
+    # [double]::TryParse is not. On a Turkish system "." is the thousands
+    # separator, so a culture-sensitive read of "62.09" returns 6209 - enough to
+    # make the safety logic throttle a 62 C card down by several steps. Pin the
+    # invariant culture so every caller sees the same number.
     param($Value)
     if ($null -eq $Value) { return $null }
     $s = ("$Value").Trim()
-    if ($s -match '^-?[0-9]+(\.[0-9]+)?$') { return [double]$s }
+    $d = 0.0
+    if ([double]::TryParse($s, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d }
     return $null
 }
 
