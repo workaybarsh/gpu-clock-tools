@@ -61,6 +61,9 @@ and release it when the work ends.
 
 # hold while *any* GPU load exists, no process tracking
 .\watchdog\gpu-clock-watchdog.ps1 -LoadOnly -LoadThreshold 30
+
+# also hold a working temperature, and survive idle gaps inside a long job
+.\watchdog\gpu-clock-watchdog.ps1 -TargetClock 2350 -TargetTemp 65 -ProcessName YOUR_MINER -MissLimit 0
 ```
 
 ### Tuner (find the right value once per card)
@@ -74,10 +77,14 @@ thermal behaviour, so an idle card would simply look "already cool enough".
 ```
 
 `Auto` steps the clock down 100 MHz at a time until the card sits at or below
-the target, then steps back up 50 MHz to find the highest acceptable point. It
-takes 5-10 minutes, writes the result to `gpu-profile.json`, and then
-**hands over to the watchdog** so the found clock is held while the work
-continues and released when it stops.
+the target, then steps back up 50 MHz to find the highest acceptable point. That
+search is fast, so it finishes with a **verification phase**: the candidate is
+held for `-VerifySeconds` (default 300 s) - a water loop needs several minutes to
+reach equilibrium, and the 180 s search step alone would stop too high - and the
+clock is stepped down until the *settled* temperature really is on target. Total
+run time is roughly 15-45 minutes. The result is written to `gpu-profile.json`
+and the script **hands over to the watchdog**, which holds the clock *and* the
+working temperature while the work continues and releases both when it stops.
 
 If you would rather just set the ceiling yourself and skip the search:
 
@@ -94,7 +101,9 @@ Main tuner options:
 | `-TargetTemp` | `65` | Temperature goal for `Auto` |
 | `-MaxTemp` / `-MaxFan` | `80` / `85` | Emergency ceilings |
 | `-StepCoarse` / `-StepFine` | `100` / `50` | Search step sizes in MHz |
-| `-SettleSeconds` / `-StepSeconds` | `90` / `120` | How long to wait at stock / per step |
+| `-SettleSeconds` / `-StepSeconds` | `90` / `180` | How long to wait at stock / per search step |
+| `-VerifySeconds` / `-MaxVerifySteps` | `300` / `4` | Thermal settling wait per verification step, and how many 50 MHz steps it may walk down |
+| `-WatchTargetTemp` | `0` | Temperature the watchdog holds afterwards (`Auto` passes its own `-TargetTemp`) |
 | `-After` | `Watch` | `Watch` hands over to the watchdog, `Keep` leaves the lock, `Release` drops it |
 | `-DryRun` | | Never write to the GPU |
 
@@ -164,13 +173,15 @@ Default location: `%LOCALAPPDATA%\gpu-clock-tools\gpu-profile.json`
 | Event | Watchdog | Tuner (`-After Watch`, default) |
 |-------|----------|-------------------------------|
 | Workload ends | **Released** (`-rgc`) and exits | **Released** (handed to the watchdog) |
-| Ctrl+C / window closed | Released | Released |
+| Ctrl+C | Released | Released |
+| Window closed with X | **Not guaranteed** - PowerShell is killed without cleanup | Same |
 | `-KeepLock` passed | Kept | - |
 | `-After Keep` | - | Kept until `-Mode Clear` |
 | `-Mode Clear` | - | Released |
 | Sleep (S3) | Re-applied within `RefreshSeconds` | Same (watchdog re-applies) |
 | Reboot / shutdown | Lost (driver memory) | Lost |
 | Driver update / TDR | Re-applied while running | Re-applied while running |
+| Second instance started | Exits immediately via a named mutex, touches nothing | - |
 
 Nothing is written to disk except `gpu-profile.json`. Nothing starts at boot.
 
@@ -184,9 +195,28 @@ Both tools lower the clock further if the card gets too hot:
 |---------|--------|
 | Temperature >= `MaxTemp` (80 C) | Cut another `SafetyStep` MHz |
 | Fan >= `MaxFan` (85%) | Cut another `SafetyStep` MHz |
+| Temperature >= `-TargetTemp` (watchdog) | Cut another `SafetyStep` MHz, so a verified 65 C stays 65 C |
 | Failure to apply the lock | Report and stop, leaving the card alone |
+| Clock still reads above the requested value | Retry once, then report the conflict (another tuning tool writing to NVML) |
 
 Neither tool ever sets a clock above the card's maximum.
+
+---
+
+## Known limits
+
+- **Temperature is the only health signal.** There is no hashrate or hardware
+  error tracking: GeForce cards report `[N/A]` for the ECC counters, and the
+  only hardware-error figure available (a miner's `HW:` counter) is specific to
+  one program. When mining, read that counter yourself - a clock that runs cool
+  can still produce memory errors.
+- Only the **core** clock is tuned. Memory clocks (`-lmc` / `-rmc`) are left
+  alone, although they matter for mining efficiency.
+- The saved profile is keyed by **card**, not by workload. A value verified
+  under a light load is not automatically safe for a heavier one. Re-run
+  `-Mode Auto` with the workload you actually care about.
+- Verification is bounded: at most `MaxVerifySteps` x `StepFine` MHz below the
+  search result, so a badly wrong search is reported instead of chased forever.
 
 ---
 

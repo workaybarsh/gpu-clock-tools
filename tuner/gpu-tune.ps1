@@ -12,10 +12,15 @@
       2. Idles at stock clocks, waits for temperatures to settle
       3. If above target: steps down 100 MHz at a time
       4. Once below target: steps back up 50 MHz to find the highest safe point
-      5. Locks the found value and keeps it while it runs
-      6. If temperature drifts upward, reduces further automatically
-      7. Hands over to the watchdog (default) which keeps the lock while the
-         GPU is in use and releases it when the work stops
+      5. VERIFIES the found value: sits at it for -VerifySeconds and re-reads the
+         temperature. A liquid cooler needs several minutes to reach
+         equilibrium, so the quick search alone stops too high. If the settled
+         temperature is above the target, the clock is lowered and re-verified.
+      6. Saves the verified value and hands over to the watchdog (default),
+         which keeps the lock while the GPU is in use and releases it when the
+         work stops
+      7. If the lock is still applied when this script is interrupted (Ctrl+C,
+         error), it is released before exit
 
     IMPORTANT - RUN THIS WHILE YOUR WORKLOAD IS RUNNING:
       Temperature-based tuning is only meaningful while the card is actually
@@ -61,6 +66,20 @@
 .PARAMETER MaxFan
     Emergency fan ceiling in percent (default 85).
 
+.PARAMETER VerifySeconds
+    How long the found clock is held before the temperature is read back
+    (default 300). This is the thermal settling wait: the 180 s used per search
+    step is too short for a liquid cooler, so without this check the saved value
+    runs hotter than the target once the loop reaches equilibrium.
+
+.PARAMETER MaxVerifySteps
+    How many 50 MHz steps the verification phase may walk down (default 4).
+
+.PARAMETER WatchTargetTemp
+    Temperature the watchdog should hold after the hand-off. Auto mode passes
+    its own -TargetTemp. Fixed and Percent leave it at 0 (no temperature
+    tracking, only the 80 C emergency ceiling).
+
 .PARAMETER ProcessName
     Processes to watch. Empty means "run until Ctrl+C".
 
@@ -93,7 +112,10 @@ param(
     [int]$StepCoarse = 100,
     [int]$StepFine = 50,
     [int]$SettleSeconds = 90,
-    [int]$StepSeconds = 120,
+    [int]$StepSeconds = 180,
+    [int]$VerifySeconds = 300,
+    [int]$MaxVerifySteps = 4,
+    [int]$WatchTargetTemp = 0,
     [int]$MaxSteps = 30,
 
     [string[]]$ProcessName = @(),
@@ -232,19 +254,100 @@ function Save-Profile {
     }
 }
 
+function Get-CurrentClock {
+    $r = Invoke-Smi @('-i', "$script:Gpu", '--query-gpu=clocks.gr', '--format=csv,noheader,nounits')
+    if ($r.Code -ne 0) { return $null }
+    return (To-Num $r.Text)
+}
+
 function Set-ClockLock {
     param([int]$Mhz)
+
     if ($DryRun) { Write-Log "[DryRun] would run: -lgc $Mhz"; return $true }
-    $r = Invoke-Smi @('-i', "$script:Gpu", '-eow', '-lgc', "$Mhz")
-    if ($r.Code -eq 0) { return $true }
-    Write-Log "ERROR -lgc $Mhz : $($r.Text)"
-    return $false
+
+    # -eow (--error-on-warning) is deliberately NOT used. It turned any driver
+    # warning into a non-zero exit code, which aborted the run mid-search and
+    # left the card locked at an arbitrary intermediate clock. Warnings are
+    # logged instead, and the result is verified by reading the clock back.
+    $r = Invoke-Smi @('-i', "$script:Gpu", '-lgc', "$Mhz")
+    if ($r.Code -ne 0) {
+        Write-Log "ERROR -lgc $Mhz : $($r.Text)"
+        return $false
+    }
+    if ($r.Text) { Write-Log "nvidia-smi: $($r.Text)" }
+
+    $script:LockApplied = $true
+
+    Start-Sleep -Milliseconds 800
+    $now = Get-CurrentClock
+    if ($null -ne $now -and $now -gt ($Mhz + 50)) {
+        Write-Log "WARNING: asked for $Mhz MHz but the card reports $now MHz - retrying once."
+        Start-Sleep -Seconds 2
+        $r2 = Invoke-Smi @('-i', "$script:Gpu", '-lgc', "$Mhz")
+        if ($r2.Code -ne 0) {
+            Write-Log "ERROR -lgc $Mhz (retry) : $($r2.Text)"
+            return $false
+        }
+        Start-Sleep -Milliseconds 800
+        $now = Get-CurrentClock
+        if ($null -ne $now -and $now -gt ($Mhz + 50)) {
+            Write-Log "ERROR: the clock cap did not take effect (asked $Mhz MHz, card reports $now MHz). Another tuning tool may be writing to NVML."
+            return $false
+        }
+    }
+    return $true
 }
 
 function Clear-ClockLock {
     if ($DryRun) { Write-Log '[DryRun] would run: -rgc'; return }
     $r = Invoke-Smi @('-i', "$script:Gpu", '-rgc')
     if ($r.Code -ne 0) { Write-Log "WARNING -rgc failed: $($r.Text)" }
+    else { $script:LockApplied = $false }
+}
+
+function Get-AverageTemp {
+    # A single sample is noisy and, right after a clock change, still shows the
+    # previous step's temperature. Average a few samples instead.
+    param([int]$Samples = 3, [int]$IntervalSeconds = 5)
+
+    $sum = 0.0
+    $n = 0
+    for ($i = 0; $i -lt $Samples; $i++) {
+        $g = Get-GpuInfo
+        if ($null -ne $g.Temp) { $sum = $sum + $g.Temp; $n++ }
+        if ($i -lt ($Samples - 1)) { Start-Sleep -Seconds $IntervalSeconds }
+    }
+    if ($n -eq 0) { return $null }
+    return [math]::Round($sum / $n, 1)
+}
+
+function Confirm-Clock {
+    # The search in Auto mode optimises for speed, not for equilibrium. This
+    # phase holds the candidate for VerifySeconds and walks it down until the
+    # settled temperature really is at or below the target.
+    param([int]$Candidate, [int]$Floor = 600)
+
+    $value = $Candidate
+    for ($try = 0; $try -lt $MaxVerifySteps; $try++) {
+        if (-not (Set-ClockLock $value)) {
+            Write-Log "ERROR: could not apply $value MHz during verification."
+            return $null
+        }
+        Write-Log "Verifying $value MHz: holding for $VerifySeconds s for thermal equilibrium..."
+        Start-Sleep -Seconds $VerifySeconds
+        $avg = Get-AverageTemp -Samples 3 -IntervalSeconds 5
+        if ($null -eq $avg) {
+            Write-Log "WARNING: could not read the temperature; accepting $value MHz unverified."
+            return $value
+        }
+        Write-Log ("  settled: {0} C (target {1} C)" -f $avg, $TargetTemp)
+        if ($avg -le $TargetTemp) { return $value }
+        $next = [math]::Max($Floor, $value - $StepFine)
+        if ($next -eq $value) { return $value }
+        Write-Log ("  above target -> stepping down to {0} MHz" -f $next)
+        $value = $next
+    }
+    return $value
 }
 
 function Test-UnderLoad {
@@ -389,6 +492,11 @@ function Invoke-After {
 
     Write-Log "Target clock: $ClockTarget MHz ($Label)"
 
+    # From here on the lock has a deliberate owner: the watchdog, the user
+    # (Keep) or nobody (Release). The cleanup in Auto mode only releases a lock
+    # that was left behind by an abort.
+    $script:LeftToOwner = $true
+
     switch ($After) {
 
         'Watch' {
@@ -399,12 +507,10 @@ function Invoke-After {
                 return
             }
             Write-Log 'Handing over to the watchdog: holds the lock while GPU work runs, releases it when work stops.'
-            if ($ProcessName.Count -gt 0) {
-                & $watchdog -GpuIndex $GpuIndex -TargetClock $ClockTarget -ProcessName $ProcessName
-            }
-            else {
-                & $watchdog -GpuIndex $GpuIndex -TargetClock $ClockTarget
-            }
+            $watchArgs = @('-GpuIndex', "$GpuIndex", '-TargetClock', "$ClockTarget")
+            if ($WatchTargetTemp -gt 0) { $watchArgs += @('-TargetTemp', "$WatchTargetTemp") }
+            if ($ProcessName.Count -gt 0) { $watchArgs += @('-ProcessName', ($ProcessName -join ',')) }
+            & $watchdog @watchArgs
         }
 
         'Keep' {
@@ -447,64 +553,92 @@ if ($Mode -eq 'Auto') {
         exit 3
     }
 
-    Write-Log "Settling at stock clocks for $SettleSeconds seconds..."
-    Start-Sleep -Seconds $SettleSeconds
-    $probe = Get-GpuInfo
+    $script:LockApplied = $false
+    $script:LeftToOwner = $false
+    if ($WatchTargetTemp -le 0) { $WatchTargetTemp = $TargetTemp }
 
-    if ($null -ne $probe.Temp -and $probe.Temp -le $TargetTemp) {
-        Write-Log "Stock already below target ($($probe.Temp) C <= $TargetTemp C) -> no lock needed."
-        Write-Log 'The card manages itself under this load. Use a lower -TargetTemp if you want a cooler card.'
+    try {
+        Write-Log "Settling at stock clocks for $SettleSeconds seconds..."
+        Start-Sleep -Seconds $SettleSeconds
+        $probe = Get-GpuInfo
+        $stockClock = $probe.CoreClock
+
+        $avgStock = Get-AverageTemp -Samples 3 -IntervalSeconds 5
+        if ($null -ne $avgStock -and $avgStock -le $TargetTemp) {
+            Write-Log ("Stock already below target ({0} C average <= {1} C) -> no lock needed." -f $avgStock, $TargetTemp)
+            Write-Log 'The card manages itself under this load. Use a lower -TargetTemp if you want a cooler card.'
+            exit 0
+        }
+
+        $cap = [int]$info.MaxClock
+        if ($null -ne $stockClock -and $stockClock -gt 0 -and $stockClock -lt $cap) {
+            $cap = [int]$stockClock
+            Write-Log "Search starts at the current clock ($cap MHz) rather than the maximum."
+        }
+        $searchTop = $cap
+        $found = $false
+        $steps = 0
+
+        while ($cap -gt 600 -and $steps -lt $MaxSteps) {
+            $steps++
+            $cap = $cap - $StepCoarse
+            if (-not (Set-ClockLock $cap)) { throw 'Could not apply clock lock (permission or support problem).' }
+            Write-Log "Trying $cap MHz, waiting $StepSeconds s..."
+            Start-Sleep -Seconds $StepSeconds
+            $i = Get-GpuInfo
+            Write-Log ("  result: {0} C, fan {1}%, {2} W, {3} MHz" -f $i.Temp, $i.Fan, $i.Power, $i.CoreClock)
+            if ($null -ne $i.Temp -and $i.Temp -le $TargetTemp) { $found = $true; break }
+        }
+
+        if (-not $found) {
+            Write-Log 'ERROR: reached 600 MHz without meeting the target. Releasing the lock.'
+            exit 4
+        }
+
+        # Fine tuning: step back up 50 MHz while we stay 2 C below target. The
+        # ceiling is the clock the card already sustained at stock - above that
+        # there is nothing to win.
+        while ($true) {
+            $try = $cap + $StepFine
+            if ($searchTop -gt 0 -and $try -ge $searchTop) { break }
+            if (-not (Set-ClockLock $try)) { break }
+            Start-Sleep -Seconds $StepSeconds
+            $i = Get-GpuInfo
+            if ($null -ne $i.Temp -and $i.Temp -le ($TargetTemp - 2)) {
+                Write-Log ("  step up accepted: {0} MHz / {1} C" -f $try, $i.Temp)
+                $cap = $try
+            }
+            else {
+                Write-Log ("  step up rejected: {0} MHz / {1} C -> back to {2} MHz" -f $try, $i.Temp, $cap)
+                Set-ClockLock $cap | Out-Null
+                break
+            }
+        }
+
+        # The search steps are too short for a water loop to reach equilibrium,
+        # so the candidate is optimistic. Hold it, measure, and walk down until
+        # the settled temperature really is at or below the target.
+        Write-Log "Search result: $cap MHz. Verification follows (settling $VerifySeconds s per step)."
+        $verified = Confirm-Clock -Candidate $cap
+        if ($null -eq $verified) {
+            Write-Log 'ERROR: verification could not apply the clock cap.'
+            exit 4
+        }
+        if ($verified -ne $cap) { Write-Log "Verified clock: $verified MHz (search candidate was $cap MHz)." }
+        $cap = $verified
+
+        Write-Log "SAFE CLOCK FOUND: $cap MHz (target $TargetTemp C, verified)"
+        Save-Profile $info $cap $TargetTemp
+
+        Invoke-After -ClockTarget $cap -Label 'auto'
         exit 0
     }
-
-    $cap = [int]$info.MaxClock
-    if ($null -ne $info.CoreClock -and $info.CoreClock -gt 0 -and $info.CoreClock -lt $cap) {
-        $cap = [int]$info.CoreClock
-        Write-Log "Search starts at the current clock ($cap MHz) rather than the maximum."
-    }
-    $found = $false
-    $steps = 0
-
-    while ($cap -gt 600 -and $steps -lt $MaxSteps) {
-        $steps++
-        $cap = $cap - $StepCoarse
-        if (-not (Set-ClockLock $cap)) { throw 'Could not apply clock lock (permission or support problem).' }
-        Write-Log "Trying $cap MHz, waiting $StepSeconds s..."
-        Start-Sleep -Seconds $StepSeconds
-        $i = Get-GpuInfo
-        Write-Log ("  result: {0} C, fan {1}%, {2} W, {3} MHz" -f $i.Temp, $i.Fan, $i.Power, $i.CoreClock)
-        if ($null -ne $i.Temp -and $i.Temp -le $TargetTemp) { $found = $true; break }
-    }
-
-    if (-not $found) {
-        Write-Log 'ERROR: reached 600 MHz without meeting the target. Releasing the lock.'
-        Clear-ClockLock
-        exit 4
-    }
-
-    # fine tuning: step back up 50 MHz while we stay 2 C below target
-    while ($true) {
-        $try = $cap + $StepFine
-        if ($try -ge $info.MaxClock) { break }
-        if (-not (Set-ClockLock $try)) { break }
-        Start-Sleep -Seconds $StepSeconds
-        $i = Get-GpuInfo
-        if ($null -ne $i.Temp -and $i.Temp -le ($TargetTemp - 2)) {
-            Write-Log ("  step up accepted: {0} MHz / {1} C" -f $try, $i.Temp)
-            $cap = $try
-        }
-        else {
-            Write-Log ("  step up rejected: {0} MHz / {1} C -> back to {2} MHz" -f $try, $i.Temp, $cap)
-            Set-ClockLock $cap | Out-Null
-            break
+    finally {
+        if ($script:LockApplied -and -not $script:LeftToOwner) {
+            Write-Log 'Run was interrupted - releasing the clock lock (-rgc).'
+            Clear-ClockLock
         }
     }
-
-    Write-Log "SAFE CLOCK FOUND: $cap MHz (target $TargetTemp C)"
-    Save-Profile $info $cap $TargetTemp
-
-    Invoke-After -ClockTarget $cap -Label 'auto'
-    exit 0
 }
 
 # ------------------------------------------------------------------ fixed / percent

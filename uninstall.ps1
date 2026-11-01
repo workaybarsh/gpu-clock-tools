@@ -13,7 +13,7 @@ Write-Host '  Removing GPU Clock Tools...' -ForegroundColor Cyan
 
 # 1) stop any running instance (watchdog, tuner, launcher)
 $stopped = 0
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" | Where-Object {
     $_.ProcessId -ne $PID -and
     $_.CommandLine -and
     $_.CommandLine -match '-File.*(gpu-clock-watchdog|gpu-tune)\.ps1'

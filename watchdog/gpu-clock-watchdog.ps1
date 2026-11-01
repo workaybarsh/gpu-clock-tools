@@ -16,6 +16,8 @@
       2. -ProcessName
          Watch one or more named processes instead. Use this when you want to
          be explicit (for example a launcher that starts the real worker).
+         This mode survives GPU idle phases inside a long job (scene loading,
+         encode passes) because it tracks the process, not the utilization.
 
       3. Any GPU load
          With -LoadOnly, the lock is held whenever total GPU utilization is
@@ -29,12 +31,21 @@
 
     SAFETY:
       If the temperature or the fan reaches its ceiling, the cap is lowered
-      further automatically. The cap is never raised above the card maximum.
+      further automatically. With -TargetTemp the card is also held at or
+      below that working temperature, not just below the emergency ceiling.
+      The cap is never raised above the card maximum.
 
     LOCK LIFE CYCLE:
       Released with -rgc when the workload ends, when you press Ctrl+C, or when
       -MissLimit consecutive polls find no work. Pass -KeepLock to leave the
       cap in place after exit instead.
+
+      Closing the console window with the X button terminates PowerShell without
+      running cleanup, so the cap can be left behind. Use Ctrl+C.
+
+      Only one instance runs at a time: a named mutex ("Local\gpu-clock-tools-
+      watchdog") makes a second copy exit without touching the clocks, so two
+      watchdogs can never release each other's cap.
 
 .PARAMETER GpuIndex
     Which card. 0 = first, 1 = second.
@@ -63,15 +74,22 @@
     %LOCALAPPDATA%\gpu-clock-tools\gpu-profile.json
 
 .PARAMETER PollSeconds
-    How often the workload is checked (default 10).
+    How often the workload is checked (default 10). The payload sampling time is
+    subtracted from this interval, so it is a real cycle time.
 
 .PARAMETER MissLimit
     Consecutive polls without work before the lock is released and the tool
-    exits (default 3).
+    exits (default 3). Use 0 to wait forever and keep the cap for the whole
+    session (daemon style).
 
 .PARAMETER RefreshSeconds
     How often the lock is re-applied while work continues (default 60).
     Covers driver resets, sleep and resume.
+
+.PARAMETER TargetTemp
+    Working temperature to hold while the work runs, in Celsius (0 = off).
+    When the measured temperature stays at or above it, the ceiling is lowered
+    by SafetyStep MHz. Pass the value the tuner found.
 
 .PARAMETER MaxTemp
     Emergency temperature ceiling in Celsius (default 80).
@@ -91,7 +109,15 @@
     .\gpu-clock-watchdog.ps1 -Percent 76 -ProcessName YOUR_MINER
 
 .EXAMPLE
+    .\gpu-clock-watchdog.ps1 -TargetClock 2350 -TargetTemp 65 -ProcessName YOUR_MINER
+
+.EXAMPLE
     .\gpu-clock-watchdog.ps1 -LoadOnly -LoadThreshold 30
+
+.EXAMPLE
+    .\gpu-clock-watchdog.ps1 -TargetClock 1900 -MissLimit 0
+
+    Never gives up: holds the cap until Ctrl+C, even across idle gaps.
 
 .NOTES
     Requires administrator rights (nvidia-smi -lgc).
@@ -117,6 +143,7 @@ param(
     [int]$MissLimit = 3,
     [int]$RefreshSeconds = 60,
 
+    [int]$TargetTemp = 0,
     [int]$MaxTemp = 80,
     [int]$MaxFan = 85,
     [int]$SafetyStep = 50,
@@ -181,6 +208,23 @@ function Get-GpuState {
         Fan        = (To-Num $p[6])
         Util       = (To-Num $p[7])
     }
+}
+
+function Get-CurrentClock {
+    $r = Invoke-Smi @('-i', "$script:Gpu", '--query-gpu=clocks.gr', '--format=csv,noheader,nounits')
+    if ($r.Code -ne 0) { return $null }
+    return (To-Num $r.Text)
+}
+
+function Wait-Poll {
+    # Sleeps the remainder of the poll interval. Detection costs a few seconds
+    # (three 1 s counter samples), so a plain "sleep PollSeconds" made every
+    # cycle about 13 s instead of 10 s.
+    param([datetime]$CycleStart)
+    $elapsed = ((Get-Date) - $CycleStart).TotalSeconds
+    $sleep = $PollSeconds - $elapsed
+    if ($sleep -lt 1) { $sleep = 1 }
+    Start-Sleep -Milliseconds ([int]($sleep * 1000))
 }
 
 # ------------------------------------------------------------------ GPU engine counters
@@ -251,12 +295,49 @@ function Get-TopGpuUser {
 # ------------------------------------------------------------------ clock control
 
 function Set-ClockLock {
-    param([int]$Mhz)
-    if ($DryRun) { Write-Log "[DryRun] would run: -lgc $Mhz"; return $true }
-    $r = Invoke-Smi @('-i', "$script:Gpu", '-eow', '-lgc', "$Mhz")
-    if ($r.Code -eq 0) { return $true }
-    Write-Log "ERROR -lgc $Mhz : $($r.Text)"
-    return $false
+    param([int]$Mhz, [switch]$Quiet)
+
+    if ($DryRun) {
+        if (-not $Quiet) { Write-Log "[DryRun] would run: -lgc $Mhz" }
+        return $true
+    }
+
+    # -eow (--error-on-warning) is deliberately NOT used. It turned any driver
+    # warning into a non-zero exit code, which made this function return false
+    # and aborted the whole session - leaving the card unlocked for the rest of
+    # the job. Warnings are logged instead, and the result is verified by
+    # reading the clock back.
+    $r = Invoke-Smi @('-i', "$script:Gpu", '-lgc', "$Mhz")
+    if ($r.Code -ne 0) {
+        Write-Log "ERROR -lgc $Mhz : $($r.Text)"
+        return $false
+    }
+    if ($r.Text) { Write-Log "nvidia-smi: $($r.Text)" }
+
+    Start-Sleep -Milliseconds 800
+    $now = Get-CurrentClock
+
+    if ($null -ne $now -and $now -gt ($Mhz + 50)) {
+        Write-Log "WARNING: asked for $Mhz MHz but the card reports $now MHz - retrying once."
+        Start-Sleep -Seconds 2
+        $r2 = Invoke-Smi @('-i', "$script:Gpu", '-lgc', "$Mhz")
+        if ($r2.Code -ne 0) {
+            Write-Log "ERROR -lgc $Mhz (retry) : $($r2.Text)"
+            return $false
+        }
+        Start-Sleep -Milliseconds 800
+        $now = Get-CurrentClock
+        if ($null -ne $now -and $now -gt ($Mhz + 50)) {
+            Write-Log "ERROR: the clock cap did not take effect (asked $Mhz MHz, card reports $now MHz). Another tuning tool may be writing to NVML."
+            return $false
+        }
+    }
+
+    if (-not $Quiet) {
+        if ($null -eq $now) { Write-Log "Lock applied: $Mhz MHz (clock read-back unavailable)." }
+        else { Write-Log "Lock applied: $Mhz MHz (card reports $now MHz)." }
+    }
+    return $true
 }
 
 function Clear-ClockLock {
@@ -318,13 +399,42 @@ if ($Info) {
     $top = Get-TopGpuUser -Minimum $LoadThreshold
     if ($top) { Write-Log "current GPU user: $($top.Name) (PID $($top.Pid)) at $($top.Percent)%" }
     else { Write-Log 'current GPU user: none above threshold' }
-    Write-Log "poll ${PollSeconds}s | miss limit $MissLimit | refresh ${RefreshSeconds}s"
+    if ($TargetTemp -gt 0) { Write-Log "working temperature: hold at or below $TargetTemp C" }
+    else { Write-Log "working temperature: not tracked (emergency ceiling $MaxTemp C)" }
+    if ($MissLimit -gt 0) { Write-Log "poll ${PollSeconds}s | miss limit $MissLimit | refresh ${RefreshSeconds}s" }
+    else { Write-Log "poll ${PollSeconds}s | miss limit off (runs until Ctrl+C) | refresh ${RefreshSeconds}s" }
+    if ($null -eq $state.Fan) { Write-Log 'fan speed: not reported by this card, fan ceiling disabled' }
     exit 0
 }
 
 if ($target -le 0) {
     Write-Log 'ERROR: no clock target. Use -TargetClock <MHz>, -Percent <n>, or run gpu-tune -Mode Auto first.'
     exit 1
+}
+
+# ------------------------------------------------------------------ single instance
+
+# Two watchdogs used to be able to coexist: the one that exited first called
+# -rgc and silently dropped the other one's cap. A named mutex makes the second
+# copy exit before it touches anything.
+$script:MutexName = 'Local\gpu-clock-tools-watchdog'
+$script:Mutex = $null
+$script:HaveMutex = $false
+
+if (-not $DryRun) {
+    try {
+        $script:Mutex = New-Object System.Threading.Mutex($false, $script:MutexName)
+        try { $script:HaveMutex = $script:Mutex.WaitOne(0) }
+        catch [System.Threading.AbandonedMutexException] { $script:HaveMutex = $true }
+    }
+    catch {
+        Write-Log "WARNING: single-instance check unavailable: $($_.Exception.Message)"
+        $script:HaveMutex = $true
+    }
+    if (-not $script:HaveMutex) {
+        Write-Log 'ERROR: another gpu-clock-watchdog is already holding a clock cap. Exiting without touching the clocks.'
+        exit 5
+    }
 }
 
 # ------------------------------------------------------------------ main loop
@@ -342,14 +452,17 @@ $script:counterBroken = $false
 
 Write-Log "watchdog started (PID $PID)"
 Write-Log "card: $($state.Name) | lock target $target MHz from $source"
+if ($TargetTemp -gt 0) { Write-Log "working temperature target: $TargetTemp C (emergency ceiling $MaxTemp C)" }
 switch ($mode) {
     'process' { Write-Log "watching processes: $($watch -join ', ')" }
     'load' { Write-Log "watching total GPU load, threshold $LoadThreshold%" }
     default { Write-Log 'watching the top GPU consumer (auto detection)' }
 }
+if ($MissLimit -le 0) { Write-Log 'miss limit disabled: the cap stays until Ctrl+C' }
 
 try {
     while ($true) {
+        $cycleStart = Get-Date
         $worked = $false
         $who = ''
 
@@ -390,11 +503,11 @@ try {
 
         if (-not $worked) {
             $miss++
-            if ($miss -ge $MissLimit) {
+            if ($MissLimit -gt 0 -and $miss -ge $MissLimit) {
                 Write-Log 'No GPU work detected -> stopping.'
                 break
             }
-            Start-Sleep -Seconds $PollSeconds
+            Wait-Poll -CycleStart $cycleStart
             continue
         }
 
@@ -405,7 +518,7 @@ try {
         if ($RefreshSeconds -gt 0 -and $locked -and ((Get-Date) - $lastApply).TotalSeconds -ge $RefreshSeconds) { $needApply = $true }
 
         if ($needApply) {
-            if (Set-ClockLock $safe) {
+            if (Set-ClockLock -Mhz $safe -Quiet $locked) {
                 if (-not $locked) {
                     if ($DryRun) { Write-Log "[DryRun] would apply: $safe MHz (work: $who)" }
                     else { Write-Log "Lock applied: $safe MHz (work: $who)" }
@@ -420,17 +533,29 @@ try {
         }
 
         $s = Get-GpuState
-        $t = 0; if ($null -ne $s.Temp) { $t = $s.Temp }
-        $f = 0; if ($null -ne $s.Fan) { $f = $s.Fan }
+        $t = 0
+        if ($null -ne $s.Temp) { $t = $s.Temp }
+        $f = $null
+        if ($null -ne $s.Fan) { $f = $s.Fan }
 
-        if ($t -ge $MaxTemp -or $f -ge $MaxFan) {
-            $safe = [math]::Max(600, $safe - $SafetyStep)
-            Write-Log "SAFETY: $t C / fan $f% -> lowered to $safe MHz"
-            if (-not (Set-ClockLock $safe)) { break }
-            $lastApply = Get-Date
+        # One reason per poll, so a hot card walks down in SafetyStep increments
+        # instead of jumping. Stricter reasons win.
+        $reason = ''
+        if ($t -ge $MaxTemp) { $reason = "MAX TEMP $t C >= $MaxTemp C" }
+        elseif ($null -ne $f -and $f -ge $MaxFan) { $reason = "MAX FAN $f% >= $MaxFan%" }
+        elseif ($TargetTemp -gt 0 -and $t -ge $TargetTemp) { $reason = "WORKING TEMP $t C >= $TargetTemp C" }
+
+        if ($reason) {
+            $next = [math]::Max(600, $safe - $SafetyStep)
+            if ($next -lt $safe) {
+                Write-Log "SAFETY: $reason -> lowered to $next MHz"
+                if (-not (Set-ClockLock -Mhz $next -Quiet $true)) { break }
+                $safe = $next
+                $lastApply = Get-Date
+            }
         }
 
-        Start-Sleep -Seconds $PollSeconds
+        Wait-Poll -CycleStart $cycleStart
     }
 }
 finally {
@@ -442,6 +567,13 @@ finally {
             Clear-ClockLock
             Write-Log 'Lock released (-rgc).'
         }
+    }
+    if ($script:HaveMutex -and $null -ne $script:Mutex) {
+        try { $script:Mutex.ReleaseMutex() } catch { }
+        $script:HaveMutex = $false
+    }
+    if ($null -ne $script:Mutex) {
+        try { $script:Mutex.Dispose() } catch { }
     }
 }
 
